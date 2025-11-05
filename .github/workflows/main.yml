@@ -104,14 +104,28 @@ jobs:
 
             echo "Successfully deployed to \$IDLE_COLOR"
 
-            # Switch NGINX to new idle port
-            echo "Updating NGINX to point to port $IDLE_PORT"
-            # sudo sed -i "s|localhost:[0-9]*|localhost:$IDLE_PORT|g" /etc/nginx/conf.d/bluegreen.conf
+           # Switch NGINX to new idle port
+            # NOTE: The sed command must be corrected to change the internal port only.
+            # We are changing 'proxy_pass http://localhost:PORT_NUMBER;' 
+            echo "Updating NGINX to point to internal port $IDLE_APP_PORT"
+            
+            # This is the crucial change to match your NGINX file (proxy_pass http://localhost:;)
             sudo sed -i "s|proxy_pass http://localhost:[0-9]*|proxy_pass http://localhost:$IDLE_APP_PORT|g" /etc/nginx/conf.d/bluegreen.conf
+            
+            # If the proxy_pass line is 'proxy_pass http://localhost:;' (empty port), you need to handle the first run:
+            if [ "\$ACTIVE_COLOR" == "none" ]; then
+                sudo sed -i "s|proxy_pass http://localhost:;|proxy_pass http://localhost:$IDLE_APP_PORT;|g" /etc/nginx/conf.d/bluegreen.conf
+            else
+                # Use the substitution logic for subsequent runs
+                sudo sed -i "s|proxy_pass http://localhost:[0-9]*;|proxy_pass http://localhost:$IDLE_APP_PORT;|g" /etc/nginx/conf.d/bluegreen.conf
+            fi
+
+            # Note: I added a semicolon (;) to the sed commands to match the NGINX file format exactly.
             sudo nginx -s reload
 
 
             echo "Traffic switched to \$IDLE_COLOR"
+
 
             # Optionally remove old active container (optional cleanup step, can be skipped for rollback flexibility)
             if [ "\$ACTIVE_COLOR" != "none" ]; then
