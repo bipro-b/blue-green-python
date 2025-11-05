@@ -1,97 +1,139 @@
-deploy:
-  runs-on: ubuntu-latest
-  needs: build-and-push
+name: CI/CD for Flask App (Blue-Green Deployment) # <--- Line 1: 'name' is expected
 
-  steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+on:
+  push:
+    branches:
+      - main  # Trigger pipeline on push to main branch
 
-    - name: Deploy to AWS EC2 (Blue-Green Deployment)
-      run: |
-        echo "${{ secrets.AWS_KEY }}" > private_key.pem
-        chmod 600 private_key.pem
+jobs: # <--- 'jobs' property is required next, and 'build-and-push' starts here
+  build-and-push:
+    runs-on: ubuntu-latest
 
-        ssh -o StrictHostKeyChecking=no -i private_key.pem ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << EOF
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-          # --- MySQL Setup (Same) ---
-          docker network create app_network || true
-          if ! docker ps --filter "name=mysql-db" | grep mysql-db; then
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app .
+          docker push ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+  deploy: # <--- This job is correctly nested under 'jobs' and starts at the same level as 'build-and-push'
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Deploy to AWS EC2 (Blue-Green Deployment)
+        run: |
+          echo "${{ secrets.AWS_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << EOF
+
+            # Ensure Docker network exists
+            docker network create app_network || true
+
+            # Ensure MySQL is running - starts once, doesn't restart on app deployment
+            if ! docker ps --filter "name=mysql-db" | grep mysql-db; then
+              docker run -d \
+                --name mysql-db \
+                --network app_network \
+                -e MYSQL_ROOT_PASSWORD=root \
+                -e MYSQL_DATABASE=attendance_db \
+                mysql:latest # Removed -p 3306:3306 as it's not needed by app_network
+
+              echo "Waiting for MySQL to initialize..."
+              sleep 30
+            fi
+
+            # Health check loop to make sure MySQL is fully up
+            echo "Waiting for MySQL to become available..."
+            until docker exec mysql-db mysqladmin ping -h "localhost" --silent; do
+                echo "MySQL is not ready yet, retrying..."
+                sleep 15
+            done
+            echo "MySQL is ready, up and running"
+
+            # --- Blue/Green Logic: Use Internal Ports (8000/8001) ---
+            if docker ps --filter "name=flask-app-blue" | grep flask-app-blue; then
+                ACTIVE_COLOR="blue"
+                IDLE_COLOR="green"
+                IDLE_APP_PORT=8001 
+            elif docker ps --filter "name=flask-app-green" | grep flask-app-green; then
+                ACTIVE_COLOR="green"
+                IDLE_COLOR="blue"
+                IDLE_APP_PORT=8000
+            else
+                # First deployment case (default to blue)
+                ACTIVE_COLOR="none"
+                IDLE_COLOR="blue"
+                IDLE_APP_PORT=8000
+            fi
+
+            echo "Active Color: \$ACTIVE_COLOR"
+            echo "Deploying to: \$IDLE_COLOR on internal port \$IDLE_APP_PORT"
+
+            # Authenticate and pull the new image
+            docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+            docker pull ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+
+            # Stop and remove the old idle container if it exists
+            docker stop flask-app-\$IDLE_COLOR || true
+            docker rm flask-app-\$IDLE_COLOR || true
+
+            # Run new Flask app in idle slot
+            # MAPPING: Host's Internal Port (8000/8001) -> Container's Port (5000)
             docker run -d \
-              --name mysql-db \
+              --name flask-app-\$IDLE_COLOR \
               --network app_network \
-              -e MYSQL_ROOT_PASSWORD=root \
-              -e MYSQL_DATABASE=attendance_db \
-              mysql:latest
-            echo "Waiting for MySQL to initialize..."
-            sleep 30
-          fi
-          echo "Waiting for MySQL to become available..."
-          until docker exec mysql-db mysqladmin ping -h "localhost" --silent; do
-              echo "MySQL is not ready yet, retrying..."
-              sleep 15
-          done
-          echo "MySQL is ready, up and running"
+              -p \$IDLE_APP_PORT:5000 \ 
+              -e DB_HOST=mysql-db \
+              -e DB_USER=root \
+              -e DB_PASSWORD=root \
+              -e DB_NAME=attendance_db \
+              ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
 
-          # --- Blue/Green Logic: Use Internal Ports (8000/8001) ---
-          if docker ps --filter "name=flask-app-blue" | grep flask-app-blue; then
-              ACTIVE_COLOR="blue"
-              IDLE_COLOR="green"
-              # Internal host port for NGINX to proxy to
-              IDLE_APP_PORT=8001 
-          elif docker ps --filter "name=flask-app-green" | grep flask-app-green; then
-              ACTIVE_COLOR="green"
-              IDLE_COLOR="blue"
-              # Internal host port for NGINX to proxy to
-              IDLE_APP_PORT=8000
-          else
-              # First deployment case (default to blue)
-              ACTIVE_COLOR="none"
-              IDLE_COLOR="blue"
-              IDLE_APP_PORT=8000
-          fi
+            echo "Successfully deployed to \$IDLE_COLOR"
+            
+            # --- Health Check (Crucial Safety Step) ---
+            echo "Waiting for new container on port \$IDLE_APP_PORT to be healthy..."
+            TIMEOUT=60
+            COUNT=0
+            while ! curl -f http://localhost:\$IDLE_APP_PORT/ && [ \$COUNT -lt \$TIMEOUT ]; do
+                echo "Waiting for port \$IDLE_APP_PORT..."
+                sleep 5
+                COUNT=\$((COUNT+5))
+            done
+            if [ \$COUNT -ge \$TIMEOUT ]; then
+                echo "Health check failed after \$TIMEOUT seconds. Aborting deployment."
+                exit 1
+            fi
+            echo "New container is healthy!"
+            
+            # --- NGINX Switch ---
+            echo "Updating NGINX to point to internal port \$IDLE_APP_PORT"
+            
+            # Substitute the port number in the proxy_pass directive
+            sudo sed -i "s|proxy_pass http://localhost:[0-9]*;|proxy_pass http://localhost:\$IDLE_APP_PORT;|g" /etc/nginx/conf.d/bluegreen.conf
+            
+            sudo nginx -s reload
 
-          echo "Active Color: \$ACTIVE_COLOR"
-          echo "Deploying to: \$IDLE_COLOR on internal port \$IDLE_APP_PORT"
+            echo "Traffic switched to \$IDLE_COLOR"
 
-          # Authenticate and pull the new image
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          docker pull ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
+            # Optional cleanup
+            if [ "\$ACTIVE_COLOR" != "none" ]; then
+                docker stop flask-app-\$ACTIVE_COLOR || true
+                docker rm flask-app-\$ACTIVE_COLOR || true
+                echo "Removed old \$ACTIVE_COLOR container"
+            fi
 
-          # Stop and remove the old idle container if it exists
-          docker stop flask-app-\$IDLE_COLOR || true
-          docker rm flask-app-\$IDLE_COLOR || true
-
-          # Run new Flask app in idle slot
-          # MAPPING: Host's Internal Port (8000/8001) -> Container's Port (5000)
-          docker run -d \
-            --name flask-app-\$IDLE_COLOR \
-            --network app_network \
-            -p \$IDLE_APP_PORT:5000 \ 
-            -e DB_HOST=mysql-db \
-            -e DB_USER=root \
-            -e DB_PASSWORD=root \
-            -e DB_NAME=attendance_db \
-            ${{ secrets.DOCKER_USERNAME }}/flask-attendance-app
-
-          echo "Successfully deployed to \$IDLE_COLOR"
-          
-          # --- NGINX Switch ---
-          echo "Updating NGINX to point to internal port $IDLE_APP_PORT"
-          
-          # Use the correct sed command to substitute the port number
-          # This handles both 8000 -> 8001 and 8001 -> 8000 
-          # and is robust if your initial file starts with a valid port (e.g., 8000)
-          sudo sed -i "s|proxy_pass http://localhost:[0-9]*;|proxy_pass http://localhost:\$IDLE_APP_PORT;|g" /etc/nginx/conf.d/bluegreen.conf
-          
-          sudo nginx -s reload
-
-          echo "Traffic switched to \$IDLE_COLOR"
-
-          # Optional cleanup
-          if [ "\$ACTIVE_COLOR" != "none" ]; then
-              docker stop flask-app-\$ACTIVE_COLOR || true
-              docker rm flask-app-\$ACTIVE_COLOR || true
-              echo "Removed old \$ACTIVE_COLOR container"
-          fi
-
-        EOF
+          EOF
